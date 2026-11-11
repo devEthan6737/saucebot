@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from src.agent.model import model
 from src.agent.context import Context
+from src.agent.memory import memory
 from src.agent.tools import tools
 
 personality = (Path(__file__).parent / "personality.txt").read_text().strip()
@@ -19,7 +20,7 @@ def prompt (request):
 agent = create_agent(
     model,
     tools,
-    middleware=[ prompt ],
+    middleware=[ prompt, memory ],
     context_schema=Context,
     checkpointer=InMemorySaver(),
 )
