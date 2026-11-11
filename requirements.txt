@@ -2,3 +2,7 @@ python-dotenv
 python-telegram-bot
 langchain
 langchain-deepseek
+vosk
+piper-tts
+fastapi
+uvicorn[standard]

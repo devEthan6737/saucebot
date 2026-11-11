@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chef saucebot</title>
+<style>
+    :root {
+        --bg: #faf8f5; --card: #ffffff; --text: #2b2723; --muted: #7a7168;
+        --accent: #c8501e; --accent-text: #ffffff; --line: #e8e2da; --user: #f1ebe3;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg: #171513; --card: #211e1b; --text: #efe9e2; --muted: #9a9087;
+            --accent: #e0693a; --accent-text: #171513; --line: #35302b; --user: #2b2723;
+        }
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0; background: var(--bg); color: var(--text);
+        font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 640px; margin: 0 auto; padding: 24px 16px 32px; display: flex; flex-direction: column; gap: 16px; min-height: 100vh; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    .sub { margin: 4px 0 0; color: var(--muted); }
+    details { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
+    summary { cursor: pointer; font-weight: 600; }
+    ul { margin: 8px 0 0; padding-left: 20px; }
+    .status { display: flex; align-items: center; gap: 12px; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); flex: none; }
+    .dot.listening { background: #2e9e5b; animation: pulse 1.4s infinite; }
+    .dot.thinking { background: #d9a21b; }
+    .dot.speaking { background: var(--accent); animation: pulse 0.9s infinite; }
+    @keyframes pulse { 50% { transform: scale(1.5); opacity: 0.6; } }
+    button {
+        font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 14px 20px;
+        background: var(--accent); color: var(--accent-text); cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    button.secondary {
+        margin-left: auto; padding: 6px 14px; background: transparent;
+        color: var(--text); border: 1px solid var(--line);
+    }
+    #chat { flex: 1; display: flex; flex-direction: column; gap: 8px; }
+    .bubble { padding: 10px 14px; border-radius: 14px; max-width: 85%; border: 1px solid var(--line); background: var(--card); }
+    .bubble.user { align-self: flex-end; background: var(--user); }
+    .bubble.partial { opacity: 0.6; }
+    form { display: flex; gap: 8px; }
+    input {
+        flex: 1; font: inherit; padding: 12px 14px; border-radius: 12px;
+        border: 1px solid var(--line); background: var(--card); color: var(--text);
+    }
+    .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+    <header>
+        <h1 id="title">Chef saucebot</h1>
+        <p class="sub" id="description"></p>
+    </header>
+
+    <details>
+        <summary>Ingredientes</summary>
+        <ul id="stock"></ul>
+        <p class="sub" id="missing-title"></p>
+        <ul id="missing"></ul>
+    </details>
+
+    <button id="start">Empezar a cocinar</button>
+
+    <div class="status hidden" id="status-box">
+        <span class="dot" id="dot"></span>
+        <span id="status"></span>
+        <button class="secondary hidden" id="interrupt">Interrumpir</button>
+    </div>
+
+    <div id="chat"></div>
+
+    <form id="form" class="hidden">
+        <input id="input" placeholder="O escríbeme aquí" autocomplete="off" disabled>
+        <button id="send" disabled>Enviar</button>
+    </form>
+</main>
+
+<script>
+const token = location.pathname.split("/").pop();
+const $ = id => document.getElementById(id);
+
+let ws, ctx, finished = false;
+let wantAudio = false;     // the mic is sent only while we are waiting for the user
+let turnEnded = false;     // the server finished its turn
+let playing = false;
+let currentSource = null;
+let ignoring = false;      // after interrupting, what the chef was still sending is dropped
+const queue = [];
+let chefBubble = null;
+let partialBubble = null;
+
+// ---- recipe ----
+fetch("/api/cook/" + token).then(r => r.json()).then(recipe => {
+    $("title").textContent = recipe.name;
+    $("description").textContent = `${recipe.description} · ${recipe.servings} raciones`;
+    const line = i => `${i.name}: ${i.quantity} ${i.unit}`;
+    for (const i of recipe.in_stock) $("stock").append(Object.assign(document.createElement("li"), { textContent: line(i) }));
+    if (recipe.missing.length) {
+        $("missing-title").textContent = "Te faltan:";
+        for (const i of recipe.missing) $("missing").append(Object.assign(document.createElement("li"), { textContent: line(i) }));
+    }
+}).catch(() => {});
+
+// ---- ui ----
+function setState(state, text) {
+    $("dot").className = "dot " + state;
+    $("status").textContent = text;
+    $("input").disabled = $("send").disabled = state !== "listening";
+    $("interrupt").classList.toggle("hidden", state !== "speaking" && state !== "thinking");
+}
+
+function bubble(text, who) {
+    const el = document.createElement("div");
+    el.className = "bubble " + who;
+    el.textContent = text;
+    $("chat").append(el);
+    el.scrollIntoView({ behavior: "smooth", block: "end" });
+    return el;
+}
+
+// ---- sound out ----
+async function enqueue(data) {
+    const buffer = await ctx.decodeAudioData(data);
+    if (ignoring) return;
+    queue.push(buffer);
+    playNext();
+}
+
+function playNext() {
+    if (playing || !queue.length) return;
+    playing = true;
+    setState("speaking", "Hablando…");
+    const source = ctx.createBufferSource();
+    source.buffer = queue.shift();
+    source.connect(ctx.destination);
+    source.onended = () => { playing = false; currentSource = null; playNext(); maybeListen(); };
+    currentSource = source;
+    source.start();
+}
+
+// stops the chef: the sound that is playing, the queue and what the server is still preparing
+$("interrupt").onclick = () => {
+    ignoring = true;
+    wantAudio = false;
+    queue.length = 0;
+    chefBubble = null;
+    if (currentSource) {
+        currentSource.onended = null;
+        currentSource.stop();
+        currentSource = null;
+    }
+    playing = false;
+    setState("", "Interrumpido…");
+    ws.send(JSON.stringify({ type: "interrupt" }));
+};
+
+// when the chef has finished talking, it is the user's turn
+function maybeListen() {
+    if (finished) { if (!playing && !queue.length) setState("", "Receta terminada. ¡Que aproveche!"); return; }
+    if (!turnEnded || playing || queue.length) return;
+    turnEnded = false;
+    wantAudio = true;
+    ws.send(JSON.stringify({ type: "listening" }));
+    setState("listening", "Te escucho…");
+}
+
+// ---- sound in ----
+const workletCode = `
+class Down extends AudioWorkletProcessor {
+    constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; this.acc = 0; this.n = 0; this.out = []; }
+    process(inputs) {
+        const channel = inputs[0][0];
+        if (!channel) return true;
+        for (let i = 0; i < channel.length; i++) {
+            this.acc += channel[i]; this.n++; this.pos++;
+            if (this.pos >= this.ratio) { this.out.push(this.acc / this.n); this.acc = 0; this.n = 0; this.pos -= this.ratio; }
+        }
+        if (this.out.length >= 1600) {
+            const pcm = new Int16Array(this.out.length);
+            for (let i = 0; i < pcm.length; i++) { const s = Math.max(-1, Math.min(1, this.out[i])); pcm[i] = s < 0 ? s * 32768 : s * 32767; }
+            this.port.postMessage(pcm.buffer, [pcm.buffer]);
+            this.out = [];
+        }
+        return true;
+    }
+}
+registerProcessor("down", Down);`;
+
+async function startMic() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+    const url = URL.createObjectURL(new Blob([workletCode], { type: "text/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+
+    const node = new AudioWorkletNode(ctx, "down");
+    node.port.onmessage = e => { if (wantAudio && ws.readyState === 1) ws.send(e.data); };
+
+    // the node has to be connected to run, but it must not play the mic
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    ctx.createMediaStreamSource(stream).connect(node);
+    node.connect(mute).connect(ctx.destination);
+}
+
+// ---- server ----
+function connect() {
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/" + token);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+        setState("thinking", "Preparando al chef…");
+        ws.send(JSON.stringify({ type: "start" }));
+    };
+
+    ws.onmessage = event => {
+        if (typeof event.data !== "string") { if (!ignoring) enqueue(event.data); return; }
+        const msg = JSON.parse(event.data);
+
+        // until the server confirms the interruption, the old turn is dropped
+        if (ignoring) {
+            if (msg.type !== "turn_end" && msg.type !== "done") return;
+            ignoring = false;
+        }
+
+        if (msg.type === "chef") {
+            if (!chefBubble) chefBubble = bubble("", "chef");
+            chefBubble.textContent += (chefBubble.textContent ? " " : "") + msg.text;
+        } else if (msg.type === "partial") {
+            if (!partialBubble) partialBubble = bubble("", "user partial");
+            partialBubble.textContent = msg.text;
+        } else if (msg.type === "user") {
+            wantAudio = false;
+            turnEnded = false;
+            chefBubble = null;
+            if (partialBubble) { partialBubble.remove(); partialBubble = null; }
+            bubble(msg.text, "user");
+            setState("thinking", "Pensando…");
+        } else if (msg.type === "error") {
+            bubble(msg.text, "chef");
+        } else if (msg.type === "turn_end" || msg.type === "done") {
+            finished = msg.type === "done";
+            turnEnded = true;
+            maybeListen();
+        }
+    };
+
+    ws.onclose = () => { if (!finished) setState("", "Conexión cerrada. Recarga la página para volver."); };
+}
+
+$("start").onclick = async () => {
+    $("start").classList.add("hidden");
+    $("status-box").classList.remove("hidden");
+    $("form").classList.remove("hidden");
+    try {
+        // the audio context has to be created after a click
+        ctx = new AudioContext();
+        await ctx.resume();
+        await startMic();
+    } catch (e) {
+        bubble("No puedo usar el micrófono, pero puedes escribirme.", "chef");
+    }
+    connect();
+};
+
+$("form").onsubmit = event => {
+    event.preventDefault();
+    const text = $("input").value.trim();
+    if (!text || ws.readyState !== 1) return;
+    $("input").value = "";
+    wantAudio = false;
+    turnEnded = false;
+    chefBubble = null;
+    bubble(text, "user");
+    setState("thinking", "Pensando…");
+    ws.send(JSON.stringify({ type: "text", text }));
+};
+</script>
+</body>
+</html>
