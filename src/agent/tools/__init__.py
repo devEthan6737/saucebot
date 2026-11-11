@@ -9,4 +9,5 @@ tools = [
     load("inventory:list").list_items,
     load("inventory:remove").remove_item,
     load("inventory:expiring").expiring_soon,
+    load("recipes:suggest").suggest_recipe,
 ]

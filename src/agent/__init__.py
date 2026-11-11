@@ -3,14 +3,11 @@ from pathlib import Path
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import dynamic_prompt
-from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.config import DEEPSEEK_API_KEY
+from src.agent.model import model
 from src.agent.context import Context
 from src.agent.tools import tools
-
-model = ChatDeepSeek(model="deepseek-chat", api_key=DEEPSEEK_API_KEY)
 
 personality = (Path(__file__).parent / "personality.txt").read_text().strip()
 
